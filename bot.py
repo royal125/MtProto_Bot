@@ -10,11 +10,12 @@ import aiohttp
 import concurrent.futures
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import Config
+from db import init_db, save_link, get_link, delete_expired_links
 
 # ----------------------------
 # Logging
@@ -31,12 +32,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # ----------------------------
-# Directories & storage
+# Directories
 # ----------------------------
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
-file_storage = {}
-allowed_users = set()  # Users allowed to bypass group check
+allowed_users = set()
 
 # ----------------------------
 # Thread pool
@@ -53,57 +53,33 @@ bot_started = False
 # Utilities
 # ----------------------------
 async def check_group_subscription(user_id: int) -> bool:
-    """Check if user is member of the required group"""
     try:
-        group_username = "GBEXTREME"  # Without '@'
+        group_username = "GBEXTREME"
         member = await bot.get_chat_member(group_username, user_id)
         return member.status in ["member", "administrator", "creator"]
     except Exception as e:
         logger.error(f"Group subscription check error: {e}")
         return False
 
-def generate_download_url(file_id: str, file_name: str, file_path: str, file_size: int) -> str:
-    token = secrets.token_urlsafe(16)
-    file_storage[token] = {
-        'file_id': file_id,
-        'file_name': file_name,
-        'file_path': str(file_path),
-        'file_size': file_size,
-        'created_at': datetime.now()
-    }
-    return f"{Config.BASE_URL}/download/{token}"
-
-async def send_download_notification(file_name: str, file_size: int, download_url: str, user_info: str):
-    """Send notification to channel when someone gets a download link"""
-    try:
-        channel_id = -1002986443155  # Your channel ID
-        
-        message_text = (
-            f"📥 **New Download Generated**\n\n"
-            f"📁 **File:** `{file_name}`\n"
-            f"📦 **Size:** {file_size / (1024*1024):.2f} MB\n"
-            f"👤 **User:** {user_info}\n"
-            f"🔗 **Download URL:** {download_url}\n"
-            f"⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        await bot.send_message(channel_id, message_text)
-        logger.info(f"Download notification sent for {file_name}")
-        
-    except Exception as e:
-        logger.error(f"Failed to send notification: {e}")
 
 async def shorten_url(long_url: str) -> str:
     try:
-        tinyurl_api = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
+        if Config.SHORTENER.lower() == "tinyurl":
+            api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
+        elif Config.SHORTENER.lower() == "isgd":
+            api_url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(long_url)}"
+        else:
+            return long_url  # No shortening, return original link
+
         async with aiohttp.ClientSession() as session:
-            async with session.get(tinyurl_api) as response:
+            async with session.get(api_url) as response:
                 if response.status == 200:
                     return (await response.text()).strip()
                 else:
                     return long_url
     except:
         return long_url
+
 
 def create_progress_bar(percentage: float, length: int = 10) -> str:
     filled_length = int(length * percentage // 100)
@@ -117,6 +93,7 @@ def create_progress_bar(percentage: float, length: int = 10) -> str:
             bar += '⬜'
     return f"{bar} {percentage:.1f}%"
 
+
 def format_eta(time_elapsed: float, downloaded: int, total_size: int) -> str:
     if downloaded == 0: return "Calculating..."
     remaining_bytes = total_size - downloaded
@@ -129,15 +106,14 @@ def format_eta(time_elapsed: float, downloaded: int, total_size: int) -> str:
     else:
         return f"{int(seconds_remaining // 3600)}h {int((seconds_remaining % 3600) // 60)}m"
 
-# ----------------------------
-# File download
-# ----------------------------
+
 async def download_telegram_file(message: Message, download_path: Path, progress_message: Message) -> bool:
     try:
-        chunk_size = 524288  # 512KB
+        chunk_size = 524288
         downloaded = 0
         start_time = datetime.now()
         total_size = 0
+
         if message.document:
             total_size = message.document.file_size
         elif message.video:
@@ -146,7 +122,9 @@ async def download_telegram_file(message: Message, download_path: Path, progress
             total_size = message.audio.file_size
         elif message.photo:
             total_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
+
         last_update_time = datetime.now()
+
         async with aiofiles.open(download_path, 'wb') as f:
             async for chunk in bot.stream_media(message, limit=chunk_size):
                 await f.write(chunk)
@@ -165,7 +143,8 @@ async def download_telegram_file(message: Message, download_path: Path, progress
                                 f"**Speed:** {download_speed:.1f}KB/s\n"
                                 f"**ETA:** {format_eta(time_elapsed, downloaded, total_size)}"
                             )
-                        except: pass
+                        except:
+                            pass
                         last_update_time = current_time
         return True
     except Exception as e:
@@ -180,16 +159,25 @@ async def download_telegram_file(message: Message, download_path: Path, progress
 async def root():
     return {"message": "Telegram File Converter Bot is running!"}
 
+
 @app.get("/download/{token}")
 async def download_file(token: str):
-    if token not in file_storage: raise HTTPException(status_code=404, detail="File not found or expired")
-    data = file_storage[token]
+    data = await get_link(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="File not found or expired")
+
     path = Path(data['file_path'])
-    if not path.exists(): del file_storage[token]; raise HTTPException(status_code=404, detail="File not found")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
     filename_encoded = urllib.parse.quote(data['file_name'])
-    return FileResponse(path=path, filename=data['file_name'], media_type='application/octet-stream',
-                        headers={'Content-Disposition': f'attachment; filename="{filename_encoded}"',
-                                 'Cache-Control': 'no-cache, no-store, must-revalidate'})
+    return FileResponse(
+        path=path,
+        filename=data['file_name'],
+        media_type='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename="{filename_encoded}"',
+                 'Cache-Control': 'no-cache, no-store, must-revalidate'}
+    )
 
 # ----------------------------
 # Bot startup
@@ -198,11 +186,10 @@ async def download_file(token: str):
 async def startup_event():
     global bot, bot_started
     try:
-        # Optimize server
         await optimize_server_performance()
         Config.validate()
+        await init_db()
 
-        # Initialize bot
         bot = Client(
             Config.SESSION_NAME,
             api_id=Config.API_ID,
@@ -213,7 +200,6 @@ async def startup_event():
             max_concurrent_transmissions=10
         )
 
-        # /start handler
         @bot.on_message(filters.command("start"))
         async def start_handler(client, message):
             user_id = message.from_user.id
@@ -227,108 +213,75 @@ async def startup_event():
                     ])
                 )
                 return
-            await message.reply(
-                "👋 **Welcome back!**\n\n"
-                "✅ You can now send any file and get a download link."
-            )
+            await message.reply("👋 **Welcome! Send any file to get a download link.**")
 
-        # Callback for "I've Joined"
         @bot.on_callback_query(filters.regex("^joined_ignore_check$"))
         async def joined_ignore_check_callback(client, callback_query):
             user_id = callback_query.from_user.id
             allowed_users.add(user_id)
             await callback_query.message.edit_text(
-                "✅ **Thanks for joining!**\n\n"
-                "🎉 You can now send any file and I'll create a download link for you!"
+                "✅ **Thanks for joining!**\n\nSend any file to get a download link!"
             )
 
-        # Media handler
         @bot.on_message(filters.media)
         async def media_handler(client, message):
-            try:
-                user_id = message.from_user.id
-                if user_id not in allowed_users:
-                    is_subscribed = await check_group_subscription(user_id)
-                    if not is_subscribed:
-                                               await message.reply("⚠️ You must join @GBEXTREME to use this bot.")
+            user_id = message.from_user.id
+            if user_id not in allowed_users:
+                is_subscribed = await check_group_subscription(user_id)
+                if not is_subscribed:
+                    await message.reply("⚠️ You must join @GBEXTREME to use this bot.")
                     return
                 allowed_users.add(user_id)
-                
 
-                # Process file
-                file_name = "file"
-                file_size = 0
-                file_id = str(message.id)
-                if message.document:
-                    file_name = message.document.file_name or "document"
-                    file_size = message.document.file_size
-                elif message.video:
-                    file_name = message.video.file_name or "video.mp4"
-                    file_size = message.video.file_size
-                elif message.audio:
-                    file_name = message.audio.file_name or "audio.mp3"
-                    file_size = message.audio.file_size
-                elif message.photo:
-                    file_name = f"photo_{message.id}.jpg"
-                    file_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
+            file_name = "file"
+            file_size = 0
+            file_id = str(message.id)
 
-                safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
-                download_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
+            if message.document:
+                file_name = message.document.file_name or "document"
+                file_size = message.document.file_size
+            elif message.video:
+                file_name = message.video.file_name or "video.mp4"
+                file_size = message.video.file_size
+            elif message.audio:
+                file_name = message.audio.file_name or "audio.mp3"
+                file_size = message.audio.file_size
+            elif message.photo:
+                file_name = f"photo_{message.id}.jpg"
+                file_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
 
-                # Send initial progress message
-                progress_msg = await message.reply("🔄 Starting download...\n[░░░░░░░░░░] 0%")
+            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
+            download_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
+            progress_msg = await message.reply("🔄 Starting download...\n[░░░░░░░░░░] 0%")
 
-                # Download the file
-                success = await download_telegram_file(message, download_path, progress_msg)
+            success = await download_telegram_file(message, download_path, progress_msg)
 
-                if success and download_path.exists():
-                    actual_size = download_path.stat().st_size
-                    long_url = generate_download_url(file_id, safe_filename, download_path, actual_size)
+            if success and download_path.exists():
+                actual_size = download_path.stat().st_size
+                token = secrets.token_urlsafe(16)
+                await save_link(token, file_id, safe_filename, str(download_path), actual_size)
 
-                    # Shorten the URL
-                    await progress_msg.edit_text("🔗 Generating short URL...")
-                    short_url = await shorten_url(long_url)
+                long_url = f"{Config.BASE_URL}/download/{token}"
+                short_url = await shorten_url(long_url)
 
-                    # Prepare user info for notification
-                    user_info = message.from_user.first_name
-                    if message.from_user.username:
-                        user_info = f"@{message.from_user.username}"
-                    user_info += f" (ID: {message.from_user.id})"
+                await progress_msg.edit_text(
+                    f"✅ **Download Ready!**\n\n"
+                    f"📁 **File:** `{safe_filename}`\n"
+                    f"📦 **Size:** {actual_size / (1024*1024):.2f} MB\n\n"
+                    f"🔗 **Short URL:** {short_url}\n"
+                    f"🌐 **Direct URL:** `{long_url}`\n\n"
+                    f"⏰ **Expires in 24 hours**"
+                )
+            else:
+                await progress_msg.edit_text("❌ **Download failed! Try again.**")
 
-                    # Send notification to the channel
-                    asyncio.create_task(send_download_notification(safe_filename, actual_size, short_url, user_info))
-
-                    # Send final message to user
-                    await progress_msg.edit_text(
-                        f"✅ **Download Complete!**\n\n"
-                        f"📁 **File:** `{safe_filename}`\n"
-                        f"📦 **Size:** {actual_size / (1024*1024):.2f} MB\n\n"
-                        f"🔗 **Short URL:** {short_url}\n"
-                        f"🌐 **Direct URL:** `{long_url}`\n\n"
-                        f"⏰ **Expires in 24 hours**"
-                    )
-                else:
-                    await progress_msg.edit_text("❌ **Download failed!** Please try again.")
-
-            except Exception as e:
-                logger.error(f"Media handler error: {e}")
-                try:
-                    await message.reply("❌ **Error processing file!** Please try again.")
-                except:
-                    pass
-
-        # Start the bot
         await bot.start()
         bot_started = True
-        me = await bot.get_me()
-        print(f"Bot started as @{me.username}")
+        print(f"Bot started as @{(await bot.get_me()).username}")
         asyncio.create_task(cleanup_old_files())
-
     except Exception as e:
         bot_started = False
         print(f"❌ Failed to start bot: {e}")
-        import traceback
-        traceback.print_exc()
 
 # ----------------------------
 # Cleanup old files
@@ -336,20 +289,7 @@ async def startup_event():
 async def cleanup_old_files():
     while True:
         await asyncio.sleep(3600)
-        current_time = datetime.now()
-        expired_tokens = []
-        for token, data in file_storage.items():
-            if current_time - data['created_at'] > timedelta(hours=24):
-                expired_tokens.append(token)
-                file_path = Path(data['file_path'])
-                if file_path.exists():
-                    try:
-                        file_path.unlink()
-                        logger.info(f"Deleted expired file: {file_path}")
-                    except:
-                        pass
-        for token in expired_tokens:
-            del file_storage[token]
+        await delete_expired_links(hours=24)
 
 # ----------------------------
 # Optimize server
@@ -359,20 +299,5 @@ async def optimize_server_performance():
         if os.name != 'nt':
             os.system('sysctl -w net.core.rmem_max=26214400 2>/dev/null || true')
             os.system('sysctl -w net.core.wmem_max=26214400 2>/dev/null || true')
-    except: 
+    except:
         pass
-
-# ----------------------------
-# Shutdown bot
-# ----------------------------
-@app.on_event("shutdown")
-async def shutdown_event():
-    global bot, bot_started
-    if bot and bot_started:
-        try:
-            await bot.stop()
-            bot_started = False
-            print("Telegram bot stopped.")
-        except Exception as e:
-            print(f"Error stopping bot: {e}")
-

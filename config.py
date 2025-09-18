@@ -10,7 +10,7 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "7966667864:AAHV3rVKSh8Oz_2nSBk8742wLhSu3gK2p1M")
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", 8000))
-    BASE_URL = os.getenv("BASE_URL", "https://7a08c14a7396.ngrok-free.app:8000")
+    BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
     SESSION_NAME = os.getenv("SESSION_NAME", "file_converter_bot")
 
     # Validate required credentials
