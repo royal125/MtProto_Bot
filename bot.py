@@ -154,11 +154,11 @@ async def startup_event():
     session_name = Config.SESSION_NAME + "_user"  # Ensure fresh user session
 
     client = Client(
-        session_name,
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        phone_number=Config.PHONE_NUMBER  # From .env, MTProto login
-    )
+    Config.SESSION_NAME,
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    phone_number=Config.PHONE_NUMBER
+)
 
     # Start MTProto client
     await client.start()
