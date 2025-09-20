@@ -7,7 +7,7 @@ load_dotenv()
 class Config:
     API_ID = int(os.getenv("API_ID", 23323985))
     API_HASH = os.getenv("API_HASH", "d24809282e7c046a98a04ca3c66659e7")
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "7966667864:AAHV3rVKSh8Oz_2nSBk8742wLhSu3gK2p1M")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "8433225445:AAFSS3wf7QG7MTewIOnho7AJ7Qg3Chh0xDg")
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", 8000))
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
