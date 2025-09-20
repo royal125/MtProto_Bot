@@ -6,11 +6,15 @@ load_dotenv()
 class Config:
     API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    BOT_TOKEN = os.getenv("BOT_TOKEN")        # Optional if you want bot token fallback
+    PHONE_NUMBER = os.getenv("PHONE_NUMBER") # Add this line
     BASE_URL = os.getenv("BASE_URL")
     SESSION_NAME = "my_bot"
 
     @staticmethod
     def validate():
-        if not Config.API_ID or not Config.API_HASH or not Config.BOT_TOKEN:
-            raise ValueError("Missing required configuration in Config class")
+        if not Config.API_ID or not Config.API_HASH:
+            raise ValueError("Missing required API_ID or API_HASH in Config")
+        # Either BOT_TOKEN or PHONE_NUMBER must exist
+        if not (Config.BOT_TOKEN or Config.PHONE_NUMBER):
+            raise ValueError("Either BOT_TOKEN or PHONE_NUMBER must be set in Config")
