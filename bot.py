@@ -3,117 +3,104 @@ import logging
 import asyncio
 import secrets
 from datetime import datetime, timedelta
-from pathlib import Path
-import urllib.parse
-import aiofiles
-import aiohttp
-import concurrent.futures
-
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message
+from pyrogram.enums import MessageMediaType
+import urllib.parse
+from pathlib import Path
+import aiofiles
+import concurrent.futures
+import aiohttp
+import math
 
 from config import Config
-from db import init_db, save_link, get_link, delete_expired_links
 
-# ----------------------------
-# Logging
-# ----------------------------
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ----------------------------
 # FastAPI app
-# ----------------------------
 app = FastAPI()
 
-# ----------------------------
-# Directories
-# ----------------------------
+# Create downloads directory
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
-allowed_users = set()
 
-# ----------------------------
-# Thread pool
-# ----------------------------
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-# ----------------------------
-# Bot instance
-# ----------------------------
+# Global bot instance
 bot = None
 bot_started = False
 
-# ----------------------------
-# Utilities
-# ----------------------------
-async def check_group_subscription(user_id: int) -> bool:
-    try:
-        group_username = "GBEXTREME"
-        member = await bot.get_chat_member(group_username, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except Exception as e:
-        logger.error(f"Group subscription check error: {e}")
-        return False
+# Thread pool for parallel processing
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
+# In-memory storage for file links
+file_storage = {}
 
 async def shorten_url(long_url: str) -> str:
+    """Shorten URL using TinyURL API"""
     try:
-        if Config.SHORTENER.lower() == "tinyurl":
-            api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
-        elif Config.SHORTENER.lower() == "isgd":
-            api_url = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(long_url)}"
-        else:
-            return long_url  # No shortening, return original link
-
+        tinyurl_api = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}"
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(api_url) as response:
+            async with session.get(tinyurl_api) as response:
                 if response.status == 200:
-                    return (await response.text()).strip()
+                    short_url = await response.text()
+                    return short_url.strip()
                 else:
+                    logger.warning(f"TinyURL API failed: {response.status}")
                     return long_url
-    except:
+    except Exception as e:
+        logger.error(f"URL shortening error: {e}")
         return long_url
 
+def generate_download_url(file_id: str, file_name: str, file_path: str, file_size: int) -> str:
+    """Generate a secure download URL"""
+    token = secrets.token_urlsafe(16)
+    file_storage[token] = {
+        'file_id': file_id,
+        'file_name': file_name,
+        'file_path': str(file_path),
+        'file_size': file_size,
+        'created_at': datetime.now()
+    }
+    return f"{Config.BASE_URL}/download/{token}"
 
-def create_progress_bar(percentage: float, length: int = 10) -> str:
-    filled_length = int(length * percentage // 100)
-    gradient = ['🟩', '🟢', '💚', '✅', '🌿']
-    bar = ''
-    for i in range(length):
-        if i < filled_length:
-            emoji_index = min(i * len(gradient) // length, len(gradient) - 1)
-            bar += gradient[emoji_index]
-        else:
-            bar += '⬜'
-    return f"{bar} {percentage:.1f}%"
-
-
-def format_eta(time_elapsed: float, downloaded: int, total_size: int) -> str:
-    if downloaded == 0: return "Calculating..."
-    remaining_bytes = total_size - downloaded
-    download_speed = downloaded / time_elapsed if time_elapsed > 0 else 0
-    seconds_remaining = remaining_bytes / download_speed if download_speed > 0 else 0
-    if seconds_remaining < 60:
-        return f"{int(seconds_remaining)}s"
-    elif seconds_remaining < 3600:
-        return f"{int(seconds_remaining // 60)}m {int(seconds_remaining % 60)}s"
-    else:
-        return f"{int(seconds_remaining // 3600)}h {int((seconds_remaining % 3600) // 60)}m"
-
+async def cleanup_old_files():
+    """Clean up files older than 24 hours"""
+    while True:
+        await asyncio.sleep(3600)
+        current_time = datetime.now()
+        expired_tokens = []
+        
+        for token, data in file_storage.items():
+            if current_time - data['created_at'] > timedelta(hours=24):
+                expired_tokens.append(token)
+                file_path = Path(data['file_path'])
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        logger.info(f"Deleted expired file: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Error deleting file {file_path}: {e}")
+        
+        for token in expired_tokens:
+            del file_storage[token]
+        
+        if expired_tokens:
+            logger.info(f"Cleaned up {len(expired_tokens)} expired files")
 
 async def download_telegram_file(message: Message, download_path: Path, progress_message: Message) -> bool:
+    """Download file from Telegram with progress updates"""
     try:
-        chunk_size = 524288
+        chunk_size = 524288  # 512KB
         downloaded = 0
-        start_time = datetime.now()
-        total_size = 0
-
+        
+        # Get total file size
         if message.document:
             total_size = message.document.file_size
         elif message.video:
@@ -122,74 +109,165 @@ async def download_telegram_file(message: Message, download_path: Path, progress
             total_size = message.audio.file_size
         elif message.photo:
             total_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
-
+        else:
+            total_size = 0
+        
         last_update_time = datetime.now()
-
+        
         async with aiofiles.open(download_path, 'wb') as f:
             async for chunk in bot.stream_media(message, limit=chunk_size):
                 await f.write(chunk)
                 downloaded += len(chunk)
+                
+                # Update progress every 2 seconds or 5% change
                 current_time = datetime.now()
                 if (current_time - last_update_time).total_seconds() >= 2 or downloaded == total_size:
                     if total_size > 0:
                         percentage = (downloaded / total_size) * 100
                         progress_bar = create_progress_bar(percentage)
-                        time_elapsed = (current_time - start_time).total_seconds()
-                        download_speed = (downloaded / 1024) / time_elapsed if time_elapsed > 0 else 0
+                        
+                        # Update progress message
                         try:
+
+                            # update progress with green color gradient write a function create_progress_bar
+                            progress_bar = create_progress_bar(percentage)
+
+
                             await progress_message.edit_text(
-                                f"📥 **Downloading...**\n\n{progress_bar}\n\n"
-                                f"**Progress:** {downloaded//1024}KB / {total_size//1024}KB\n"
-                                f"**Speed:** {download_speed:.1f}KB/s\n"
-                                f"**ETA:** {format_eta(time_elapsed, downloaded, total_size)}"
+                                f"📥 Downloading...\n"
+                                f"{progress_bar}\n"
+                                f"**{percentage:.1f}%** ({downloaded//1024}KB / {total_size//1024}KB)"
                             )
                         except:
-                            pass
+                            pass  # Ignore edit errors
+                        
                         last_update_time = current_time
+        
         return True
     except Exception as e:
         logger.error(f"Download error: {e}")
-        if download_path.exists(): download_path.unlink()
+        if download_path.exists():
+            try:
+                download_path.unlink()
+            except:
+                pass
         return False
 
-# ----------------------------
+def create_progress_bar(percentage: float, length: int = 10) -> str:
+    """Create a visual progress bar with green color gradient"""
+    filled_length = int(length * percentage // 100)
+    
+    # Green gradient emojis: from dark green to bright green
+    gradient = ['🟩', '🟢', '💚', '✅', '🌿']  # Different green emojis for gradient effect
+    
+    # Create the progress bar with gradient
+    bar = ''
+    for i in range(length):
+        if i < filled_length:
+            # Use different green emojis based on position for gradient effect
+            emoji_index = min(i * len(gradient) // length, len(gradient) - 1)
+            bar += gradient[emoji_index]
+        else:
+            bar += '⬜'  # White square for unfilled portion
+    
+    return f"{bar} {percentage:.1f}%"
+
+async def optimize_server_performance():
+    """Optimize server performance settings"""
+    try:
+        # Increase TCP buffer sizes for better throughput (Linux/Mac)
+        if os.name != 'nt':  # Not Windows
+            os.system('sysctl -w net.core.rmem_max=26214400 2>/dev/null || true')
+            os.system('sysctl -w net.core.wmem_max=26214400 2>/dev/null || true')
+        
+        logger.info("Server performance optimized")
+    except:
+        pass
+
 # FastAPI routes
-# ----------------------------
 @app.get("/")
 async def root():
     return {"message": "Telegram File Converter Bot is running!"}
 
-
 @app.get("/download/{token}")
 async def download_file(token: str):
-    data = await get_link(token)
-    if not data:
-        raise HTTPException(status_code=404, detail="File not found or expired")
+    """Handle file downloads with optimized speed"""
+    try:
+        if token not in file_storage:
+            raise HTTPException(status_code=404, detail="File not found or link expired")
+        
+        file_data = file_storage[token]
+        file_path = Path(file_data['file_path'])
+        
+        if not file_path.exists():
+            if token in file_storage:
+                del file_storage[token]
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        filename_encoded = urllib.parse.quote(file_data['file_name'])
+        
+        return FileResponse(
+            path=file_path,
+            filename=file_data['file_name'],
+            media_type='application/octet-stream',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename_encoded}"',
+                'X-Accel-Buffering': 'no',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Download endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-    path = Path(data['file_path'])
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint with bot status"""
+    try:
+        bot_status = "disconnected"
+        if bot and hasattr(bot, 'is_connected'):
+            bot_status = "connected" if bot.is_connected else "disconnected"
+        
+        return JSONResponse({
+            "status": "healthy", 
+            "bot_status": bot_status,
+            "bot_started": bot_started,
+            "files_count": len(file_storage),
+            "server_optimized": True,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return JSONResponse({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }, status_code=500)
 
-    filename_encoded = urllib.parse.quote(data['file_name'])
-    return FileResponse(
-        path=path,
-        filename=data['file_name'],
-        media_type='application/octet-stream',
-        headers={'Content-Disposition': f'attachment; filename="{filename_encoded}"',
-                 'Cache-Control': 'no-cache, no-store, must-revalidate'}
-    )
+# ... (other routes remain the same) ...
 
-# ----------------------------
-# Bot startup
-# ----------------------------
+# Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
+    """Start the bot and cleanup task"""
     global bot, bot_started
+    
     try:
+        print("=" * 50)
+        print("Starting Telegram File Converter Bot...")
+        print("=" * 50)
+        
+        # Optimize server performance
         await optimize_server_performance()
+        
+        # Validate config first
+        from config import Config
         Config.validate()
-        await init_db()
-
+        print("✓ Configuration validated")
+        
+        # Initialize bot with optimized settings
         bot = Client(
             Config.SESSION_NAME,
             api_id=Config.API_ID,
@@ -199,105 +277,121 @@ async def startup_event():
             sleep_threshold=120,
             max_concurrent_transmissions=10
         )
-
+        
+        print("✓ Bot client initialized with optimized settings")
+        
+        # Register handlers
         @bot.on_message(filters.command("start"))
         async def start_handler(client, message):
-            user_id = message.from_user.id
-            if user_id not in allowed_users:
-                await message.reply(
-                    "⚠️ **Group Membership Required**\n\n"
-                    "To use this bot, join @GBEXTREME and click below.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("Join Group 👥", url="https://t.me/GBEXTREME")],
-                        [InlineKeyboardButton("✅ I've Joined", callback_data="joined_ignore_check")]
-                    ])
-                )
-                return
-            await message.reply("👋 **Welcome! Send any file to get a download link.**")
-
-        @bot.on_callback_query(filters.regex("^joined_ignore_check$"))
-        async def joined_ignore_check_callback(client, callback_query):
-            user_id = callback_query.from_user.id
-            allowed_users.add(user_id)
-            await callback_query.message.edit_text(
-                "✅ **Thanks for joining!**\n\nSend any file to get a download link!"
+            await message.reply(
+                "👋 Hello! I'm a high-speed file to URL converter bot!\n\n"
+                "Send me any file and I'll convert it to a downloadable URL.\n\n"
+                "⚡ Progress tracking\n"
+                "🔗 Short URLs\n"
+                "📁 Supported files: All types\n"
+                "📦 Max file size: 2GB\n"
+                "⏰ Link expiration: 24 hours"
             )
-
+        
         @bot.on_message(filters.media)
         async def media_handler(client, message):
-            user_id = message.from_user.id
-            if user_id not in allowed_users:
-                is_subscribed = await check_group_subscription(user_id)
-                if not is_subscribed:
-                    await message.reply("⚠️ You must join @GBEXTREME to use this bot.")
+            try:
+                if not message.media:
                     return
-                allowed_users.add(user_id)
+                
+                file_name = "file"
+                file_size = 0
+                file_id = str(message.id)
+                
+                if message.document:
+                    file_name = message.document.file_name or "document"
+                    file_size = message.document.file_size
+                elif message.video:
+                    file_name = message.video.file_name or "video.mp4"
+                    file_size = message.video.file_size
+                elif message.audio:
+                    file_name = message.audio.file_name or "audio.mp3"
+                    file_size = message.audio.file_size
+                elif message.photo:
+                    file_name = f"photo_{message.id}.jpg"
+                    file_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
+                
+                # Create safe filename
+                safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
+                download_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
+                
+                # Send initial progress message
+                progress_msg = await message.reply("🔄 Starting download...\n[░░░░░░░░░░] 0%")
+                
+                # Download file with progress updates
+                success = await download_telegram_file(message, download_path, progress_msg)
+                
+                if success and download_path.exists():
+                    actual_size = download_path.stat().st_size
+                    long_url = generate_download_url(file_id, safe_filename, download_path, actual_size)
+                    
+                    # Shorten the URL
+                    await progress_msg.edit_text("🔗 Generating short URL...")
+                    short_url = await shorten_url(long_url)
+                    
+                    # Final success message
+                    await progress_msg.edit_text(
+                        f"✅ **Download Complete!**\n\n"
+                        f"📁 **File:** `{safe_filename}`\n"
+                        f"📦 **Size:** {actual_size / (1024*1024):.2f} MB\n\n"
+                        f"🔗 **Short URL:** {short_url}\n"
+                        f"🌐 **Direct URL:** `{long_url}`\n\n"
+                        f"⚡ **Fast download available**\n"
+                        f"⏰ **Expires in 24 hours**"
+                    )
+                else:
+                    await progress_msg.edit_text("❌ **Download failed!**\nPlease try again with a smaller file.")
+                    
+            except Exception as e:
+                logger.error(f"Media handler error: {e}")
+                try:
+                    await progress_msg.edit_text("❌ **Error processing file!**\nPlease try again.")
+                except:
+                    await message.reply("❌ Error processing file. Please try again.")
 
-            file_name = "file"
-            file_size = 0
-            file_id = str(message.id)
 
-            if message.document:
-                file_name = message.document.file_name or "document"
-                file_size = message.document.file_size
-            elif message.video:
-                file_name = message.video.file_name or "video.mp4"
-                file_size = message.video.file_size
-            elif message.audio:
-                file_name = message.audio.file_name or "audio.mp3"
-                file_size = message.audio.file_size
-            elif message.photo:
-                file_name = f"photo_{message.id}.jpg"
-                file_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
 
-            safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
-            download_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
-            progress_msg = await message.reply("🔄 Starting download...\n[░░░░░░░░░░] 0%")
 
-            success = await download_telegram_file(message, download_path, progress_msg)
-
-            if success and download_path.exists():
-                actual_size = download_path.stat().st_size
-                token = secrets.token_urlsafe(16)
-                await save_link(token, file_id, safe_filename, str(download_path), actual_size)
-
-                long_url = f"{Config.BASE_URL}/download/{token}"
-                short_url = await shorten_url(long_url)
-
-                await progress_msg.edit_text(
-                    f"✅ **Download Ready!**\n\n"
-                    f"📁 **File:** `{safe_filename}`\n"
-                    f"📦 **Size:** {actual_size / (1024*1024):.2f} MB\n\n"
-                    f"🔗 **Short URL:** {short_url}\n"
-                    f"🌐 **Direct URL:** `{long_url}`\n\n"
-                    f"⏰ **Expires in 24 hours**"
-                )
-            else:
-                await progress_msg.edit_text("❌ **Download failed! Try again.**")
-
+                    
+        
+        # Start the bot
         await bot.start()
         bot_started = True
-        print(f"Bot started as @{(await bot.get_me()).username}")
+        
+        # Get bot info
+        me = await bot.get_me()
+        print(f"✓ Bot started as @{me.username}")
+        print(f"✓ Download directory: {DOWNLOADS_DIR.absolute()}")
+        print("✓ URL shortening enabled")
+        print("✓ Progress tracking enabled")
+        
+        # Start cleanup task
         asyncio.create_task(cleanup_old_files())
+        print("✓ Cleanup task started")
+        print("=" * 50)
+        print("Enhanced bot is ready! 🚀")
+        print("=" * 50)
+        
     except Exception as e:
         bot_started = False
         print(f"❌ Failed to start bot: {e}")
+        import traceback
+        traceback.print_exc()
 
-# ----------------------------
-# Cleanup old files
-# ----------------------------
-async def cleanup_old_files():
-    while True:
-        await asyncio.sleep(3600)
-        await delete_expired_links(hours=24)
-
-# ----------------------------
-# Optimize server
-# ----------------------------
-async def optimize_server_performance():
-    try:
-        if os.name != 'nt':
-            os.system('sysctl -w net.core.rmem_max=26214400 2>/dev/null || true')
-            os.system('sysctl -w net.core.wmem_max=26214400 2>/dev/null || true')
-    except:
-        pass
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the bot"""
+    global bot, bot_started
+    if bot and bot_started:
+        try:
+            print("Stopping Telegram bot...")
+            await bot.stop()
+            bot_started = False
+            print("Telegram bot stopped.")
+        except Exception as e:
+            print(f"Error stopping bot: {e}")
