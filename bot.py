@@ -251,25 +251,24 @@ async def health_check():
 # Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
-    """Start the bot and cleanup task"""
+    """Start the bot and cleanup task safely using bot token only"""
     global bot, bot_started
-    
+
     try:
         print("=" * 50)
         print("Starting Telegram File Converter Bot...")
         print("=" * 50)
-        
-        # Optimize server performance
-        await optimize_server_performance()
-        
+
         # Validate config first
-        from config import Config
         Config.validate()
         print("✓ Configuration validated")
-        
-        # Initialize bot with optimized settings
+
+        # Force a new session name to avoid old user sessions
+        session_name = Config.SESSION_NAME + "_bot"
+
+        # Initialize bot with bot token only
         bot = Client(
-            Config.SESSION_NAME,
+            session_name,
             api_id=Config.API_ID,
             api_hash=Config.API_HASH,
             bot_token=Config.BOT_TOKEN,
@@ -277,10 +276,10 @@ async def startup_event():
             sleep_threshold=120,
             max_concurrent_transmissions=10
         )
-        
-        print("✓ Bot client initialized with optimized settings")
-        
-        # Register handlers
+
+        print("✓ Bot client initialized with bot token only")
+
+        # Register /start command handler
         @bot.on_message(filters.command("start"))
         async def start_handler(client, message):
             await message.reply(
@@ -292,17 +291,20 @@ async def startup_event():
                 "📦 Max file size: 2GB\n"
                 "⏰ Link expiration: 24 hours"
             )
-        
+
+        # Register media handler
         @bot.on_message(filters.media)
         async def media_handler(client, message):
+            from bot import download_telegram_file, generate_download_url, shorten_url, DOWNLOADS_DIR
+
             try:
                 if not message.media:
                     return
-                
+
                 file_name = "file"
                 file_size = 0
                 file_id = str(message.id)
-                
+
                 if message.document:
                     file_name = message.document.file_name or "document"
                     file_size = message.document.file_size
@@ -315,26 +317,20 @@ async def startup_event():
                 elif message.photo:
                     file_name = f"photo_{message.id}.jpg"
                     file_size = max(message.photo.sizes, key=lambda s: s.file_size).file_size
-                
-                # Create safe filename
+
                 safe_filename = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
                 download_path = DOWNLOADS_DIR / f"{file_id}_{safe_filename}"
-                
-                # Send initial progress message
+
                 progress_msg = await message.reply("🔄 Starting download...\n[░░░░░░░░░░] 0%")
-                
-                # Download file with progress updates
                 success = await download_telegram_file(message, download_path, progress_msg)
-                
+
                 if success and download_path.exists():
                     actual_size = download_path.stat().st_size
                     long_url = generate_download_url(file_id, safe_filename, download_path, actual_size)
-                    
-                    # Shorten the URL
+
                     await progress_msg.edit_text("🔗 Generating short URL...")
                     short_url = await shorten_url(long_url)
-                    
-                    # Final success message
+
                     await progress_msg.edit_text(
                         f"✅ **Download Complete!**\n\n"
                         f"📁 **File:** `{safe_filename}`\n"
@@ -346,7 +342,7 @@ async def startup_event():
                     )
                 else:
                     await progress_msg.edit_text("❌ **Download failed!**\nPlease try again with a smaller file.")
-                    
+
             except Exception as e:
                 logger.error(f"Media handler error: {e}")
                 try:
@@ -354,34 +350,29 @@ async def startup_event():
                 except:
                     await message.reply("❌ Error processing file. Please try again.")
 
-
-
-
-                    
-        
         # Start the bot
         await bot.start()
         bot_started = True
-        
-        # Get bot info
+
         me = await bot.get_me()
         print(f"✓ Bot started as @{me.username}")
         print(f"✓ Download directory: {DOWNLOADS_DIR.absolute()}")
         print("✓ URL shortening enabled")
         print("✓ Progress tracking enabled")
-        
+
         # Start cleanup task
         asyncio.create_task(cleanup_old_files())
         print("✓ Cleanup task started")
         print("=" * 50)
-        print("Enhanced bot is ready! 🚀")
+        print("Bot is ready! 🚀")
         print("=" * 50)
-        
+
     except Exception as e:
         bot_started = False
         print(f"❌ Failed to start bot: {e}")
         import traceback
         traceback.print_exc()
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
