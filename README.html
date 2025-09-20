@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram Bot VPS Setup Guide</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6f9;
+      color: #333;
+      margin: 0;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    h1 {
+      color: #0056b3;
+      text-align: center;
+    }
+    h2 {
+      color: #444;
+      border-left: 4px solid #0056b3;
+      padding-left: 10px;
+      margin-top: 30px;
+    }
+    pre {
+      background: #272822;
+      color: #f8f8f2;
+      padding: 10px;
+      border-radius: 6px;
+      overflow-x: auto;
+      position: relative;
+    }
+    button.copy-btn {
+      position: absolute;
+      top: 5px;
+      right: 5px;
+      background: #0056b3;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button.copy-btn:hover {
+      background: #003d80;
+    }
+    footer {
+      text-align: center;
+      margin-top: 40px;
+      font-size: 14px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+
+<h1>🚀 Telegram Bot VPS Setup Guide</h1>
+
+<h2>1. Update your server</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo apt update && sudo apt upgrade -y</code></pre>
+
+<h2>2. Install dependencies</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git</code></pre>
+
+<h2>3. Clone your bot project</h2>
+<pre><button class="copy-btn">Copy</button><code>cd ~
+git clone https://github.com/your-repo/MtProto_Bot.git
+cd MtProto_Bot</code></pre>
+<p>(Or if uploaded via FileZilla: <code>cd ~/MtProto_Bot</code>)</p>
+
+<h2>4. Create Python virtual environment</h2>
+<pre><button class="copy-btn">Copy</button><code>python3 -m venv venv
+source venv/bin/activate</code></pre>
+
+<h2>5. Install required Python packages</h2>
+<pre><button class="copy-btn">Copy</button><code>pip install --upgrade pip
+pip install pyrogram tgcrypto fastapi uvicorn aiohttp aiofiles python-dotenv</code></pre>
+
+<h2>6. Add your .env file</h2>
+<pre><button class="copy-btn">Copy</button><code>API_ID=23323985
+API_HASH=d24809282e7c046a98a04ca3c66659e7
+BOT_TOKEN=YOUR_BOT_TOKEN
+SESSION_NAME=my_bot
+BASE_URL=https://yourdomain.com</code></pre>
+<p>⚠️ Replace <code>YOUR_BOT_TOKEN</code> and <code>yourdomain.com</code>.</p>
+
+<h2>7. Test run the bot manually</h2>
+<pre><button class="copy-btn">Copy</button><code>cd ~/MtProto_Bot
+source venv/bin/activate
+uvicorn bot:app --host 0.0.0.0 --port 8000</code></pre>
+
+<h2>8. Setup Nginx reverse proxy</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo nano /etc/nginx/sites-available/bot</code></pre>
+<pre><button class="copy-btn">Copy</button><code>server {
+    listen 80;
+    server_name yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}</code></pre>
+<pre><button class="copy-btn">Copy</button><code>sudo ln -s /etc/nginx/sites-available/bot /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl restart nginx</code></pre>
+
+<h2>9. Enable HTTPS with Certbot</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo certbot --nginx -d yourdomain.com</code></pre>
+<p>(Choose option <b>2 → Redirect HTTP to HTTPS</b>)</p>
+
+<h2>10. Create a Systemd service</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo nano /etc/systemd/system/telegram-bot.service</code></pre>
+<pre><button class="copy-btn">Copy</button><code>[Unit]
+Description=Telegram File Converter Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/MtProto_Bot
+ExecStart=/root/MtProto_Bot/venv/bin/python3 -m uvicorn bot:app --host 0.0.0.0 --port 8000
+Restart=always
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+<h2>11. Enable & start the bot</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo systemctl daemon-reload
+sudo systemctl enable telegram-bot
+sudo systemctl start telegram-bot</code></pre>
+<pre><button class="copy-btn">Copy</button><code>sudo systemctl status telegram-bot -n 20 --no-pager</code></pre>
+
+<h2>12. (Optional) Auto reload on code changes</h2>
+<pre><button class="copy-btn">Copy</button><code>sudo nano /etc/systemd/system/telegram-bot.path</code></pre>
+<pre><button class="copy-btn">Copy</button><code>[Unit]
+Description=Restart telegram-bot on code change
+
+[Path]
+PathModified=/root/MtProto_Bot/*.py
+Unit=telegram-bot.service
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><button class="copy-btn">Copy</button><code>sudo systemctl enable telegram-bot.path
+sudo systemctl start telegram-bot.path</code></pre>
+
+<footer>
+  ✅ Bot setup complete! Now you have a running Telegram bot with HTTPS.
+</footer>
+
+<script>
+  document.querySelectorAll('.copy-btn').forEach(button => {
+    button.addEventListener('click', () => {
+      const code = button.nextElementSibling.innerText;
+      navigator.clipboard.writeText(code);
+      button.innerText = "Copied!";
+      setTimeout(() => button.innerText = "Copy", 2000);
+    });
+  });
+</script>
+
+</body>
+</html>
