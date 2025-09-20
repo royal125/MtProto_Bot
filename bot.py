@@ -1,5 +1,5 @@
 import os   
-from pyrogram.errors 
+from pyrogram.errors import UserDeactivated
 import logging
 import asyncio
 import secrets
@@ -145,19 +145,16 @@ async def notify_channel(user, file_name, file_size, short_url, long_url):
 async def startup_event():
     global bot, bot_started
     try:
-        print("Starting bot...")
-        await start_bot()  # auto-session recovery
-
-        # ------------------- Register handlers here -------------------
-        # /start, media_handler, etc.
-
-        asyncio.create_task(cleanup_old_files())
-        print("✅ Bot is fully ready!")
-
-    except Exception as e:
-        bot_started = False
-        logger.error(f"Startup failed: {e}")
-
+        Config.validate()
+        bot = Client(
+            Config.SESSION_NAME,
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            phone_number=Config.PHONE_NUMBER
+        )
+        await bot.start()
+        bot_started = True
+        print("✅ Bot started successfully")
 
         # ------------------- /start handler -------------------
         @bot.on_message(filters.command("start"))
