@@ -11,7 +11,7 @@ class Config:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", 8000))
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-    SESSION_NAME = os.getenv("SESSION_NAME", "file_converter_bot")
+    SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
     # Validate required credentials
     @classmethod
