@@ -8,7 +8,7 @@ class Config:
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     BASE_URL = os.getenv("BASE_URL")
-    SESSION_NAME = "my_bot"  # Add this line!
+    SESSION_NAME = "my_bot"
 
     @staticmethod
     def validate():
