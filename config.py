@@ -15,5 +15,5 @@ class Config:
         if not Config.API_ID or not Config.API_HASH:
             raise ValueError("Missing required API_ID or API_HASH in Config")
         # Either BOT_TOKEN or PHONE_NUMBER must exist
-        if not (Config.BOT_TOKEN or Config.PHONE_NUMBER):
-            raise ValueError("Either BOT_TOKEN or PHONE_NUMBER must be set in Config")
+        if not (Config.BOT_TOKEN):
+            raise ValueError("Either BOT_TOKEN must be set in Config")
