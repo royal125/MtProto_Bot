@@ -6,8 +6,7 @@ load_dotenv()
 class Config:
     API_ID = int(os.getenv("API_ID"))
     API_HASH = os.getenv("API_HASH")
-    BOT_TOKEN = os.getenv("BOT_TOKEN")        # Optional if you want bot token fallback
-    PHONE_NUMBER = os.getenv("PHONE_NUMBER") # Add this line
+    BOT_TOKEN = os.getenv("BOT_TOKEN")        # Optional if you want bot token fallbac
     BASE_URL = os.getenv("BASE_URL")
     SESSION_NAME = "my_bot"
 
