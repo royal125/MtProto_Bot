@@ -2,11 +2,10 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import aiohttp
 import aiofiles
-import secrets
 import urllib.parse
 
 from fastapi import FastAPI, HTTPException
@@ -20,7 +19,7 @@ from config import Config
 # ================== Logging ==================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger("bot")
 
@@ -30,10 +29,13 @@ app = FastAPI()
 
 
 # ================== Constants ==================
-CHANNEL_USERNAME = "GBEXTREME"        # Channel/group username
-CHANNEL_ID = -1002986443155           # Channel ID (for notifications)
+CHANNEL_USERNAME = "GBEXTREME"  # users see/join this
+NOTIFY_CHANNEL_ID = -1002986443155  # your channel for logs (@file2linc)
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
+
+# Optional whitelist: leave empty set() to allow everyone
+ALLOWED_USERS = set()  # e.g., {123456789}
 
 
 # ================== Global Bot ==================
@@ -41,283 +43,241 @@ bot = Client(
     Config.SESSION_NAME,
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
+    bot_token=Config.BOT_TOKEN,
 )
 
 
-# ================== File Storage ==================
-file_storage = {}
-
-
-# ================== Helper Functions ==================
-async def shorten_url(long_url: str) -> str:
-    try:
-        api = f"https://is.gd/create.php?format=simple&url={urllib.parse.quote(long_url)}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api) as response:
-                if response.status == 200:
-                    return (await response.text()).strip()
-    except Exception as e:
-        logger.error(f"URL shortening failed: {e}")
-    return long_url
-
-
-
-def generate_download_url(file_id, file_name, file_path, file_size):
-    """Generate secure download link with token."""
-    token = secrets.token_urlsafe(16)
-    file_storage[token] = {
-        "file_id": file_id,
-        "file_name": file_name,
-        "file_path": str(file_path),
-        "file_size": file_size,
-        "created_at": datetime.now()
-    }
-    return f"{Config.BASE_URL}/download/{token}"
-
-# ================== Progress Bar ==================
-
-def make_progress_bar(current, total, length=8):
-    if total == 0:
+# ================== Helpers ==================
+def make_progress_bar(current: int, total: int, length: int = 10) -> str:
+    if not total:
         return "⏳ Calculating..."
-    percent = current / total
-    filled = int(length * percent)
-    empty = length - filled
-    bar = "🟩" * filled + "⬜" * empty
-    return f"{bar} {percent*100:.1f}%"
-
-async def cleanup_old_files():
-    while True:
-        await asyncio.sleep(30)  # check every 30 seconds
-        now = datetime.now()
-        expired = []
-
-        for token, data in list(file_storage.items()):
-            # delete after 1 minute (for testing)
-            if now - data["created_at"] > timedelta(hours=18):
-                expired.append(token)
-                try:
-                    Path(data["file_path"]).unlink(missing_ok=True)
-                    logger.info(f"🗑 Deleted expired file: {data['file_path']}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to delete {data['file_path']}: {e}")
-
-        for t in expired:
-            file_storage.pop(t, None)
-
-        if expired:
-            logger.info(f"✅ Cleaned {len(expired)} expired files")
+    pct = current / total
+    filled = int(length * pct)
+    return f"{'🟩' * filled}{'⬜' * (length - filled)} {pct * 100:.1f}%"
 
 
-
-
-async def notify_channel(user, file_name, file_size, short_url, long_url):
+async def download_telegram_file(
+    message: Message, path: Path, progress_msg: Message
+) -> bool:
+    """Downloads the file to a temp path with live progress."""
     try:
-        if not user:
-            user_info = "👤 Unknown user (maybe forwarded or from a channel)"
-        else:
-            user_info = (
-                f"👤 User: {user.first_name or ''} {user.last_name or ''}\n"
-                f"🆔 User ID: {user.id}\n"
-                f"{'📛 Username: @' + user.username if user.username else ''}"
-            )
-
-        file_info = (
-            f"\n\n📁 File: {file_name}\n"
-            f"📦 Size: {file_size / (1024*1024):.2f} MB\n"
-            f"🔗 Short URL: {short_url}\n"
-            f"🌐 Direct URL: {long_url}"
-        )
-
-        await bot.send_message(CHANNEL_ID, f"{user_info}{file_info}")
-
-    except Exception as e:
-        logger.error(f"Notify channel failed: {e}")
-
-
-
-# --- /start command ---
-@bot.on_message(filters.command("start"))
-async def start_handler(c, m: Message):
-    try:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}")],
-            [InlineKeyboardButton("✅ I Have Joined", callback_data="check_joined")]
-        ])
-
-        await m.reply_animation(
-            animation="https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExMmxxcTRlcnVvejV4ejY3bmhmcDZvc2ljeWw4NnR0ZXIzODB5NGZ0eCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9cw/MTMleN1MQMYYoxJVMY/giphy.gif",
-            caption=(
-                f"👋 Welcome {m.from_user.first_name}!\n\n"
-                f"To use this bot, please join @{CHANNEL_USERNAME}.\n\n"
-                "After joining, click **✅ I Have Joined**."
-            ),
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        logger.error(f"Start handler error: {e}")
-
-
-# --- "I Have Joined" button ---
-@bot.on_callback_query(filters.regex("check_joined"))
-async def confirm_join(c, query):
-    try:
-        # Remove old buttons
-        await query.message.edit_reply_markup(None)
-
-        # Reply to user
-        await query.message.reply(
-            "✅Oh, great 😊! Now send me a file and I will create a secure download link for you."
-        )
-
-        # Answer callback so button tap feels responsive
-        await query.answer("You may now send files 🚀", show_alert=False)
-
-    except Exception as e:
-        logger.error(f"Join confirm button error: {e}")
-
-
-
-# --- Media handler ---
-@bot.on_message(filters.media)
-async def media_handler(c, m: Message):
-    try:
-        import os
-        from datetime import datetime
-
-        user = m.from_user
-        file_id = str(m.id)
-
-        # --- Detect file name & size ---
-        if m.photo:
-            # Telegram compresses photos, no original filename → save as jpg
-            file_name = f"photo_{m.id}.jpg"
-            file_size = m.photo.file_size
-
-        elif m.document:
-            file_name = m.document.file_name or "document"
-            file_size = m.document.file_size
-
-            # ✅ If file is an image (jpg or png), keep extension
-            if file_name.lower().endswith(".jpg") or file_name.lower().endswith(".jpeg"):
-                file_name = f"image_{m.id}.jpg"
-            elif file_name.lower().endswith(".png"):
-                file_name = f"image_{m.id}.png"
-
-        elif m.video:
-            file_name = m.video.file_name or "video.mp4"
-            file_size = m.video.file_size
-
-        elif m.audio:
-            file_name = m.audio.file_name or "audio.mp3"
-            file_size = m.audio.file_size
-
-        else:
-            file_name = f"file_{m.id}"
-            file_size = 0
-
-        # --- Safe filename ---
-        safe_filename = "".join(ch for ch in file_name if ch.isalnum() or ch in (" ", ".", "_")).rstrip()
-
-        # --- Downloads folder ---
-        base_dir = os.path.join(os.getcwd(), "downloads")
-        os.makedirs(base_dir, exist_ok=True)
-        download_path = os.path.join(base_dir, f"{file_id}_{safe_filename}")
-
-        # --- Progress message ---
-        progress_msg = await m.reply("📥 Starting download...")
-        start_time = datetime.now()
-
-        async def progress(current, total):
-            try:
-                bar = make_progress_bar(current, total)
-                elapsed = (datetime.now() - start_time).seconds
-                speed = current / elapsed if elapsed > 0 else 0
-                await progress_msg.edit_text(
-                    f"📥 Downloading...\n"
-                    f"{bar}\n"
-                    f"{current//(1024*1024):.2f} MB / {total//1024*1024} MB\n"
-                    f"⚡ {speed/(1024*1024):.2f} MB/s"
+        await message.download(
+            file_name=str(path),
+            progress=lambda cur, total: asyncio.get_event_loop().create_task(
+                progress_msg.edit_text(
+                    f"⏬ Downloading...\n{make_progress_bar(cur, total)}\n"
+                    f"{cur/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
                 )
-            except Exception:
-                pass
+            ),
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Download failed: {e}")
+        try:
+            await progress_msg.edit_text(f"❌ Download failed: {e}")
+        except Exception:
+            pass
+        return False
 
-        # --- Download file ---
-        await bot.download_media(m, file_name=str(download_path), progress=progress)
 
-        # --- Validate file exists ---
-        if not os.path.exists(download_path):
-            raise FileNotFoundError(f"File not found at {download_path}")
+async def upload_to_uplodash(file_path: str) -> str | None:
+    """Uploads the local file to Uploda.sh and returns a share URL, or None on fail."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            # use normal file object so aiohttp can stream it
+            form.add_field(
+                "file",
+                open(file_path, "rb"),
+                filename=os.path.basename(file_path),
+                content_type="application/octet-stream",
+            )
+            async with session.post("https://uploda.sh/api/upload", data=form) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Uploda.sh HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+                if data.get("success"):
+                    return data["data"]["url"]
+                logger.warning(f"Uploda.sh error payload: {data}")
+                return None
+    except Exception as e:
+        logger.error(f"Upload to Uploda.sh failed: {e}")
+        return None
 
-        actual_size = os.path.getsize(download_path)
 
-        # --- Generate links ---
-        long_url = generate_download_url(file_id, safe_filename, download_path, actual_size)
-        await progress_msg.edit_text("🔗 Generating short URL...")
-        short_url = await shorten_url(long_url)
+async def notify_channel(user, file_name: str, file_size_bytes: int, link: str):
+    """Sends a log message to your channel when a link is generated."""
+    try:
+        name = (user.first_name or "") + (
+            " " + user.last_name if user.last_name else ""
+        )
+        uname = f"@{user.username}" if user.username else "(no username)"
+        size_mb = (file_size_bytes or 0) / (1024 * 1024)
+        text = (
+            "📥 <b>New Upload</b>\n\n"
+            f"👤 <b>User:</b> {name.strip() or 'Unknown'} ({uname})\n"
+            f"🆔 <b>User ID:</b> <code>{user.id}</code>\n\n"
+            f"📁 <b>File:</b> <code>{file_name}</code>\n"
+            f"📦 <b>Size:</b> {size_mb:.2f} MB\n"
+            f"🔗 <b>Link:</b> {link}\n"
+            f"⏰ <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+        )
+        await bot.send_message(NOTIFY_CHANNEL_ID, text, disable_web_page_preview=True)
+    except Exception as e:
+        logger.warning(f"notify_channel failed: {e}")
 
-        # --- Success message ---
-        await progress_msg.edit_text(
-            f"✅ Download Complete!\n\n"
-            f"📁 File: {safe_filename}\n"
-            f"📦 Size: {actual_size / (1024*1024):.2f} MB\n"
-            f"🔗 Short URL: {short_url}\n"
-            f"🌐 Direct URL: {long_url}\n"
-            f"⏰ Expires in 24 hours"
+
+# ================== Handlers ==================
+@bot.on_message(filters.command("start"))
+async def start_handler(c: Client, m: Message):
+    try:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✅ I Have Joined", callback_data="joined_ignore_check"
+                    )
+                ],
+            ]
+        )
+        await m.reply_text(
+            f"👋 Welcome {m.from_user.first_name}!\n\n"
+            f"To use this bot, please join @{CHANNEL_USERNAME}.\n"
+            f"After joining, tap <b>✅ I Have Joined</b>.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"/start error: {e}")
+
+
+@bot.on_callback_query(filters.regex("^joined_ignore_check$"))
+async def joined_ignore_check(c: Client, q):
+    """Allow usage without re-checking membership."""
+    try:
+        await q.message.edit_reply_markup(None)
+        await q.message.reply_text(
+            "✅ Great! Now send me any file and I’ll create a Uploda.sh link for you. 🚀"
+        )
+        await q.answer("You may now send files.", show_alert=False)
+    except Exception as e:
+        logger.error(f"joined_ignore_check error: {e}")
+
+
+@bot.on_message(filters.media)
+async def on_media(c: Client, m: Message):
+    try:
+        # Optional whitelist
+        if ALLOWED_USERS and m.from_user.id not in ALLOWED_USERS:
+            return await m.reply_text("⚠️ Join @GBEXTREME to use this bot.")
+
+        # Detect file meta
+        file_name = (
+            m.document.file_name
+            if m.document
+            else (
+                m.video.file_name
+                if m.video
+                else (
+                    m.audio.file_name
+                    if m.audio
+                    else f"photo_{m.id}.jpg" if m.photo else "file"
+                )
+            )
+        )
+        file_size = (
+            m.document.file_size
+            if m.document
+            else (
+                m.video.file_size
+                if m.video
+                else (
+                    m.audio.file_size
+                    if m.audio
+                    else (m.photo.sizes[-1].file_size if m.photo else 0)
+                )
+            )
         )
 
-        # --- Notify channel ---
+        safe_name = (
+            "".join(c for c in file_name if c.isalnum() or c in "._ ").strip() or "file"
+        )
+        path = DOWNLOADS_DIR / f"{m.id}_{safe_name}"
+
+        prog = await m.reply_text("⏳ Preparing...")
+
+        # Download from Telegram
+        ok = await download_telegram_file(m, path, prog)
+        if not ok:
+            return
+
+        await prog.edit_text("📤 Uploading to Uploda.sh...")
+
+        # Upload to Uploda.sh
+        link = await upload_to_uplodash(str(path))
+        if not link:
+            return await prog.edit_text("❌ Upload failed. Please try again later.")
+
+        # Delete local file (free space)
         try:
-            await notify_channel(user, safe_filename, actual_size, short_url, long_url)
-        except Exception as e:
-            logger.error(f"[media_handler] notify_channel failed: {e}")
+            os.remove(path)
+        except Exception:
+            pass
+
+        # Final response
+        await prog.edit_text(
+            "✅ <b>Upload Completed!</b>\n\n"
+            f"📁 <b>File Name:</b> <code>{safe_name}</code>\n"
+            f"📦 <b>File Size:</b> {file_size/1024/1024:.2f} MB\n\n"
+            f"🔗 <b>File Link:</b> {link}\n"
+            f"🔗 <b>File Link (Easy Copy):</b> {link}\n\n"
+            f"📮 Join @{CHANNEL_USERNAME}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+        # Notify your channel
+        await notify_channel(m.from_user, safe_name, file_size, link)
 
     except Exception as e:
-        logger.exception(f"Media handler error: {e}")
-        await m.reply(f"⚠️ Failed to process the file.\nError: {e}")
+        logger.exception(f"on_media error: {e}")
+        try:
+            await m.reply_text(f"⚠️ Failed to process the file.\nError: {e}")
+        except Exception:
+            pass
 
-
-
-
-        
 
 # ================== FastAPI Routes ==================
 @app.get("/")
 async def root():
-    return {"message": "Telegram File Converter Bot is running!"}
-
-
-@app.get("/download/{token}")
-async def download_file(token: str):
-    if token not in file_storage:
-        raise HTTPException(status_code=404, detail="File not found or expired")
-    data = file_storage[token]
-    path = Path(data["file_path"])
-    if not path.exists():
-        file_storage.pop(token, None)
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, filename=data["file_name"], media_type="application/octet-stream")
+    return {"message": "Telegram File → Uploda.sh bot is running!"}
 
 
 @app.get("/health")
 async def health_check():
-    return JSONResponse({
-        "status": "healthy",
-        "bot_started": True,
-        "files_count": len(file_storage),
-        "timestamp": datetime.now().isoformat()
-    })
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "bot_connected": True,
+            "timestamp": datetime.now().isoformat(),
+        }
+    )
 
 
 # ================== Startup / Shutdown ==================
 @app.on_event("startup")
 async def startup_event():
     try:
-        print("🚀 Starting bot...")
+        logger.info("Starting bot…")
         Config.validate()
         await bot.start()
-        asyncio.create_task(cleanup_old_files())
-        print("✅ Bot is fully ready!")
+        logger.info("Bot started successfully.")
     except Exception as e:
         logger.error(f"Startup failed: {e}")
 
@@ -326,6 +286,6 @@ async def startup_event():
 async def shutdown_event():
     try:
         await bot.stop()
-        print("✅ Bot stopped successfully")
+        logger.info("Bot stopped.")
     except Exception as e:
         logger.error(f"Shutdown error: {e}")
